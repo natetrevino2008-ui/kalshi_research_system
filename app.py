@@ -1,3 +1,4 @@
+import csv
 import os
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -22,20 +23,19 @@ st.set_page_config(page_title="Kalshi NBA", page_icon="🏀", layout="centered")
 config.DRY_RUN = True
 
 # =============================================================================
-# Clean Apple / iOS Bubble Styling
+# Apple / iOS Bubble Styling
 # =============================================================================
 st.markdown(
     """
     <style>
     .stApp {
         background-color: #F5F5F7;
-        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif;
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif;
         color: #1D1D1F;
     }
     header[data-testid="stHeader"], footer { visibility: hidden; }
     .block-container { max-width: 660px; padding-top: 2rem; padding-bottom: 3rem; }
 
-    /* White rounded bubble cards */
     div[data-testid="stVerticalBlockBorderWrapper"] {
         background-color: #FFFFFF !important;
         border-radius: 22px !important;
@@ -45,7 +45,6 @@ st.markdown(
         margin-bottom: 10px !important;
     }
 
-    /* Fix Tune button so text is clearly visible */
     div[data-testid="stPopover"] button {
         border-radius: 999px !important;
         background-color: #FFFFFF !important;
@@ -57,7 +56,6 @@ st.markdown(
         color: #1D1D1F !important;
     }
 
-    /* Apple Blue pill button */
     div.stButton > button[kind="primary"] {
         background-color: #007AFF !important;
         color: #FFFFFF !important;
@@ -104,20 +102,28 @@ def build_explanation(row: dict) -> str:
     route = str(row.get("route") or "maker")
 
     raw_sharps = str(row.get("sharp_books") or "")
-    sharps = ", ".join(b.capitalize() for b in raw_sharps.split("|") if b) or "sharp sportsbooks"
-    outcome_text = f"<b>{team}</b> to win" if side == "YES" else f"<b>{team}</b> to lose"
-    route_note = (
+    sharps = ", ".join(b.capitalize() for b in raw_sharps.split("|") if b) or "sharp books"
+    outcome = f"<b>{team}</b> to win" if side == "YES" else f"<b>{team}</b> to lose"
+    fee_note = (
         "Placed as a resting maker order to pay $0 in fees."
         if route == "maker"
         else "Edge is large enough to buy immediately at the ask."
     )
 
     return (
-        f"Sharp books ({sharps}) give {outcome_text} a <b>{fair_prob:.1f}%</b> true chance, "
-        f"while Kalshi is pricing it at <b>{price_cents:.0f}¢</b> ({price_cents:.0f}% implied). "
+        f"Sharp books ({sharps}) give {outcome} a <b>{fair_prob:.1f}%</b> true chance, "
+        f"while Kalshi prices it at <b>{price_cents:.0f}¢</b> ({price_cents:.0f}% implied). "
         f"That leaves a <b>+{edge_pct:.1f}%</b> net edge with a tight <b>{spread_cents:.0f}¢</b> spread. "
-        f"{route_note}"
+        f"{fee_note}"
     )
+
+
+def load_run_buys(csv_path, run_id: str) -> list[dict]:
+    if not csv_path.exists():
+        return []
+    with csv_path.open(encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    return [r for r in rows if r.get("run_id") == run_id and r.get("decision") == "BUY"]
 
 
 # =============================================================================
@@ -206,8 +212,42 @@ if st.button("Scan NBA Games", type="primary", use_container_width=True):
         risk = RiskManager(risk_path)
         ledger = PaperLedger(ledger_path)
         run_scan(kalshi, fetch_snapshot, journal=journal, risk=risk, ledger=ledger)
+        st.session_state["detailed_buys"] = load_run_buys(journal.csv_path, journal.run_id)
+        st.rerun()
 
-        detailed_buys = []
-        if journal.csv_path.exists():
-            df_run = pd.read_csv(journal.csv_path)
-            df_run = df_run[(df_run["run_id"] == journal.run_id) & (df_run
+# =============================================================================
+# Picks vs All Scanned
+# =============================================================================
+view = st.radio(
+    "View",
+    ["✨ Best Picks", "📋 All Scanned"],
+    horizontal=True,
+    label_visibility="collapsed",
+)
+
+if view == "✨ Best Picks":
+    buys = st.session_state.get("detailed_buys")
+    if buys is None:
+        with st.container(border=True):
+            st.markdown("🏀 **Ready to scan** — Tap **Scan NBA Games** above to find mispriced matchups.")
+    elif not buys:
+        with st.container(border=True):
+            st.markdown("No strong edges right now. All games were priced fairly or had wide spreads.")
+    else:
+        for b in buys:
+            edge_pct = _num(b.get("net_edge")) * 100
+            price_val = _num(b.get("order_price"))
+            stake_val = _num(b.get("stake"))
+            contracts = int(_num(b.get("contracts")))
+            side_label = str(b.get("side") or "yes").upper()
+            team_name = b.get("team_yes") or b.get("kalshi_ticker")
+            explanation = build_explanation(b)
+
+            with st.container(border=True):
+                st.markdown(
+                    f"""
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <span style="font-weight:700; font-size:18px;">{team_name}</span>
+                        <span class="pill-green">+{edge_pct:.1f}% Edge</span>
+                    </div>
+                    <div style="font-
