@@ -23,18 +23,16 @@ st.set_page_config(page_title="Kalshi NBA", page_icon="🏀", layout="centered")
 config.DRY_RUN = True
 
 # =============================================================================
-# Apple / iOS Bubble Styling
+# Apple / iOS Bubble Styling (Forces clean light cards regardless of browser theme)
 # =============================================================================
 st.markdown(
     """
     <style>
-    /* Soft iOS System Gray background & San Francisco font stack */
     .stApp {
         background-color: #F5F5F7;
         font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif;
         color: #1D1D1F;
     }
-    /* Hide Streamlit header/footer clutter */
     header[data-testid="stHeader"], footer { visibility: hidden; }
     .block-container { max-width: 680px; padding-top: 2rem; padding-bottom: 3rem; }
 
@@ -45,7 +43,8 @@ st.markdown(
         padding: 20px 22px;
         margin-bottom: 14px;
         box-shadow: 0 4px 20px rgba(0, 0, 0, 0.04);
-        border: 1px solid rgba(0, 0, 0, 0.03);
+        border: 1px solid rgba(0, 0, 0, 0.04);
+        color: #1D1D1F;
     }
     .ios-label {
         font-size: 12px;
@@ -64,8 +63,24 @@ st.markdown(
     }
     .ios-sub {
         font-size: 13px;
-        color: #86868B;
+        color: #6E6E73;
         margin-top: 6px;
+    }
+
+    /* Inner explanation bubble under each pick */
+    .why-box {
+        background: #F5F5F7;
+        border-radius: 14px;
+        padding: 12px 14px;
+        margin-top: 14px;
+        font-size: 13px;
+        line-height: 1.45;
+        color: #3A3A3C;
+    }
+    .why-title {
+        font-weight: 600;
+        color: #1D1D1F;
+        margin-bottom: 2px;
     }
 
     /* Pill badges */
@@ -88,36 +103,69 @@ st.markdown(
         border-radius: 999px;
     }
 
-    /* Apple Blue pill buttons */
+    /* Apple Blue primary button */
     div.stButton > button[kind="primary"] {
-        background-color: #007AFF;
-        color: white;
-        border: none;
-        border-radius: 999px;
-        padding: 0.65rem 1.5rem;
-        font-weight: 600;
-        font-size: 16px;
-        box-shadow: 0 4px 14px rgba(0, 122, 255, 0.28);
-        transition: all 0.15s ease;
+        background-color: #007AFF !important;
+        color: #FFFFFF !important;
+        border: none !important;
+        border-radius: 999px !important;
+        padding: 0.65rem 1.5rem !important;
+        font-weight: 600 !important;
+        font-size: 16px !important;
+        box-shadow: 0 4px 14px rgba(0, 122, 255, 0.28) !important;
     }
     div.stButton > button[kind="primary"]:hover {
-        background-color: #0066D6;
-        transform: translateY(-1px);
+        background-color: #0066D6 !important;
     }
+
+    /* Fix Tune popover button contrast */
     div[data-testid="stPopover"] > button {
-        border-radius: 999px;
-        background: #FFFFFF;
-        border: 1px solid rgba(0,0,0,0.08);
-        color: #1D1D1F;
-        font-weight: 500;
+        border-radius: 999px !important;
+        background-color: #FFFFFF !important;
+        border: 1px solid rgba(0, 0, 0, 0.12) !important;
+        color: #1D1D1F !important;
+        font-weight: 600 !important;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04) !important;
+    }
+    div[data-testid="stPopover"] > button p {
+        color: #1D1D1F !important;
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
+
+def build_explanation(row: dict) -> str:
+    """Turn raw scan numbers into a simple human-readable explanation."""
+    team = row.get("team_yes") or "this team"
+    side = str(row.get("side") or "yes").upper()
+    fair_prob = float(row.get("fair_prob_side") or 0) * 100
+    price_cents = float(row.get("order_price") or 0) * 100
+    edge_pct = float(row.get("net_edge") or 0) * 100
+    spread_cents = float(row.get("spread") or 0) * 100
+    route = str(row.get("route") or "maker")
+
+    raw_sharps = str(row.get("sharp_books") or "")
+    sharps = ", ".join(b.capitalize() for b in raw_sharps.split("|") if b) or "sharp sportsbooks"
+    outcome_text = f"<b>{team}</b> to win" if side == "YES" else f"<b>{team}</b> to lose"
+
+    route_note = (
+        "Placed as a resting maker order to avoid taker fees."
+        if route == "maker"
+        else "Edge is big enough to buy immediately at the ask."
+    )
+
+    return (
+        f"Sharp books ({sharps}) give {outcome_text} a <b>{fair_prob:.1f}%</b> true chance, "
+        f"but Kalshi is pricing it at just <b>{price_cents:.0f}¢</b> ({price_cents:.0f}% implied). "
+        f"That leaves a <b>+{edge_pct:.1f}%</b> net edge with a tight <b>{spread_cents:.0f}¢</b> spread. "
+        f"{route_note}"
+    )
+
+
 # =============================================================================
-# Top Bar: Title + Minimal Settings Popover (No Sidebar!)
+# Top Bar: Title + Minimal Settings Popover
 # =============================================================================
 top_left, top_right = st.columns([3, 1])
 with top_left:
@@ -125,150 +173,4 @@ with top_left:
 with top_right:
     with st.popover("⚙️ Tune"):
         st.markdown("**Paper Settings**")
-        bankroll_val = st.number_input("Fake Bankroll ($)", 10.0, 50000.0, float(config.PAPER_BANKROLL), 25.0)
-        min_edge_val = st.slider("Min Edge (%)", 0.5, 15.0, float(config.MIN_NET_EDGE * 100), 0.5)
-        kelly_val = st.slider("Bet Size (Kelly)", 0.05, 1.0, float(config.KELLY_FRACTION), 0.05)
-        reset_btn = st.button("Reset Paper Balance", use_container_width=True)
-
-        config.PAPER_BANKROLL = Decimal(str(bankroll_val))
-        config.MIN_NET_EDGE = Decimal(str(min_edge_val)) / Decimal("100")
-        config.KELLY_FRACTION = Decimal(str(kelly_val))
-
-# =============================================================================
-# iOS Segmented Mode Switcher
-# =============================================================================
-mode = st.segmented_control(
-    "Data Source",
-    ["Offline Demo", "Live Prices (Paper)"],
-    default="Offline Demo",
-    label_visibility="collapsed",
-) or "Offline Demo"
-
-is_mock = mode == "Offline Demo"
-config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-if is_mock:
-    journal_paths = (config.DATA_DIR / "mock_trade_journal.csv", config.DATA_DIR / "mock_trade_journal.jsonl")
-    risk_path = config.DATA_DIR / "mock_risk_state.json"
-    ledger_path = config.DATA_DIR / "mock_paper_ledger.json"
-else:
-    journal_paths = (config.JOURNAL_CSV_PATH, config.JOURNAL_JSONL_PATH)
-    risk_path = config.RISK_STATE_PATH
-    ledger_path = config.PAPER_LEDGER_PATH
-
-if reset_btn:
-    for p in (ledger_path, risk_path, *journal_paths):
-        p.unlink(missing_ok=True)
-    st.toast("Paper balance reset!", icon="✨")
-
-# =============================================================================
-# Balance Bubble Card (Apple Wallet Style)
-# =============================================================================
-ledger = PaperLedger(ledger_path)
-acct = ledger.account(datetime.now(timezone.utc))
-
-st.markdown(
-    f"""
-    <div class="ios-card">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-            <span class="ios-label">Paper Balance</span>
-            <span class="pill-blue">Simulated</span>
-        </div>
-        <div class="ios-big-num">${acct.cash:,.2f}</div>
-        <div class="ios-sub">
-            Total Equity: <b>${acct.equity:,.2f}</b> &nbsp;•&nbsp; In Play: <b>${acct.exposure:,.2f}</b>
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-# =============================================================================
-# Big Pill Scan Button
-# =============================================================================
-if st.button("Scan NBA Games", type="primary", use_container_width=True):
-    if is_mock:
-        for p in (ledger_path, risk_path):
-            p.unlink(missing_ok=True)
-        kalshi, fetch_snapshot = build_mock_world()
-    else:
-        problems = config.validate_config()
-        if problems:
-            st.error("Setup needed:\n- " + "\n- ".join(problems))
-            st.stop()
-        kalshi = KalshiClient()
-        fetch_snapshot = OddsAPIClient().fetch_nba_odds
-
-    with st.spinner("Checking lines..."):
-        journal = TradeJournal(*journal_paths)
-        risk = RiskManager(risk_path)
-        ledger = PaperLedger(ledger_path)
-        result = run_scan(kalshi, fetch_snapshot, journal=journal, risk=risk, ledger=ledger)
-        st.session_state["buys"] = result["engine"].buys
-        st.session_state["counts"] = dict(result["engine"].counts)
-        st.rerun()
-
-# =============================================================================
-# View Switcher: Picks vs All Games
-# =============================================================================
-view = st.segmented_control(
-    "View",
-    ["✨ Best Picks", "📋 All Scanned"],
-    default="✨ Best Picks",
-    label_visibility="collapsed",
-) or "✨ Best Picks"
-
-if view == "✨ Best Picks":
-    buys = st.session_state.get("buys")
-    if buys is None:
-        st.markdown(
-            """
-            <div class="ios-card" style="text-align:center; padding: 32px 20px;">
-                <div style="font-size: 28px; margin-bottom: 8px;">🏀</div>
-                <div style="font-weight: 600; font-size: 16px;">Ready to scan</div>
-                <div class="ios-sub">Tap <b>Scan NBA Games</b> above to find mispriced matchups.</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    elif not buys:
-        st.markdown(
-            """
-            <div class="ios-card" style="text-align:center; padding: 28px 20px;">
-                <div style="font-weight: 600; font-size: 16px;">No strong edges right now</div>
-                <div class="ios-sub">All games were either priced fairly or had wide spreads.</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    else:
-        for b in buys:
-            edge_pct = float(b["net_edge"]) * 100
-            price_val = float(b["price"])
-            stake_val = float(b["stake"])
-            side_label = b["side"].upper()
-            st.markdown(
-                f"""
-                <div class="ios-card">
-                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                        <span style="font-weight:700; font-size:17px;">{b['ticker']}</span>
-                        <span class="pill-green">+{edge_pct:.1f}% Edge</span>
-                    </div>
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <span class="ios-sub" style="margin:0;">
-                            Buy <b>{side_label}</b> • {b['contracts']} contracts @ <b>${price_val:.2f}</b>
-                        </span>
-                        <span style="font-weight:600; font-size:15px;">${stake_val:.2f}</span>
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-else:
-    csv_file = journal_paths[0]
-    if csv_file.exists() and csv_file.stat().st_size > 0:
-        df = pd.read_csv(csv_file)
-        clean_cols = [c for c in ["kalshi_ticker", "team_yes", "decision", "net_edge", "reason"] if c in df.columns]
-        st.dataframe(df[clean_cols].tail(25), use_container_width=True, hide_index=True)
-    else:
-        st.caption("No scan history yet.")
+        bankroll_val = st
