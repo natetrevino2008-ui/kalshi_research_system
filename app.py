@@ -67,7 +67,7 @@ def load_run_buys(csv_path, run_id: str) -> list[dict]:
 # --- Top Bar ---
 top_l, top_r = st.columns([3, 1])
 with top_l:
-    st.title("🏀 Kalshi NBA")
+    st.title("TrueLine")
 with top_r:
     st.write("")
     with st.popover("⚙️ Tune", use_container_width=True):
