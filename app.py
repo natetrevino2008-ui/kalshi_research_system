@@ -22,68 +22,6 @@ from odds_client import OddsAPIClient
 st.set_page_config(page_title="Kalshi NBA", page_icon="🏀", layout="centered")
 config.DRY_RUN = True
 
-# =============================================================================
-# Apple / iOS Bubble Styling
-# =============================================================================
-st.markdown(
-    """
-    <style>
-    .stApp {
-        background-color: #F5F5F7;
-        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif;
-        color: #1D1D1F;
-    }
-    header[data-testid="stHeader"], footer { visibility: hidden; }
-    .block-container { max-width: 660px; padding-top: 2rem; padding-bottom: 3rem; }
-
-    div[data-testid="stVerticalBlockBorderWrapper"] {
-        background-color: #FFFFFF !important;
-        border-radius: 22px !important;
-        border: 1px solid rgba(0, 0, 0, 0.05) !important;
-        box-shadow: 0 4px 18px rgba(0, 0, 0, 0.04) !important;
-        padding: 6px 10px !important;
-        margin-bottom: 10px !important;
-    }
-
-    div[data-testid="stPopover"] button {
-        border-radius: 999px !important;
-        background-color: #FFFFFF !important;
-        border: 1px solid rgba(0, 0, 0, 0.14) !important;
-        color: #1D1D1F !important;
-        font-weight: 600 !important;
-    }
-    div[data-testid="stPopover"] button * {
-        color: #1D1D1F !important;
-    }
-
-    div.stButton > button[kind="primary"] {
-        background-color: #007AFF !important;
-        color: #FFFFFF !important;
-        border: none !important;
-        border-radius: 999px !important;
-        padding: 0.65rem 1.5rem !important;
-        font-weight: 600 !important;
-        font-size: 16px !important;
-        box-shadow: 0 4px 14px rgba(0, 122, 255, 0.25) !important;
-    }
-
-    .pill-blue {
-        background: #E8F2FF; color: #007AFF; font-weight: 600;
-        font-size: 12px; padding: 4px 12px; border-radius: 999px;
-    }
-    .pill-green {
-        background: #E6F8EC; color: #248A3D; font-weight: 600;
-        font-size: 12px; padding: 4px 12px; border-radius: 999px;
-    }
-    .why-box {
-        background: #F5F5F7; border-radius: 14px; padding: 12px 14px;
-        margin-top: 12px; font-size: 13px; line-height: 1.45; color: #3A3A3C;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
 
 def _num(val, default=0.0) -> float:
     try:
@@ -103,17 +41,17 @@ def build_explanation(row: dict) -> str:
 
     raw_sharps = str(row.get("sharp_books") or "")
     sharps = ", ".join(b.capitalize() for b in raw_sharps.split("|") if b) or "sharp books"
-    outcome = f"<b>{team}</b> to win" if side == "YES" else f"<b>{team}</b> to lose"
+    outcome = f"**{team}** to win" if side == "YES" else f"**{team}** to lose"
     fee_note = (
-        "Placed as a resting maker order to pay $0 in fees."
+        "Placed as a resting maker order ($0 fees)."
         if route == "maker"
         else "Edge is large enough to buy immediately at the ask."
     )
 
     return (
-        f"Sharp books ({sharps}) give {outcome} a <b>{fair_prob:.1f}%</b> true chance, "
-        f"while Kalshi prices it at <b>{price_cents:.0f}¢</b> ({price_cents:.0f}% implied). "
-        f"That leaves a <b>+{edge_pct:.1f}%</b> net edge with a tight <b>{spread_cents:.0f}¢</b> spread. "
+        f"**Why this pick?** Sharp books ({sharps}) give {outcome} a **{fair_prob:.1f}%** true chance, "
+        f"while Kalshi prices it at **{price_cents:.0f}¢** ({price_cents:.0f}% implied). "
+        f"That leaves a **+{edge_pct:.1f}%** net edge with a tight **{spread_cents:.0f}¢** spread. "
         f"{fee_note}"
     )
 
@@ -126,14 +64,13 @@ def load_run_buys(csv_path, run_id: str) -> list[dict]:
     return [r for r in rows if r.get("run_id") == run_id and r.get("decision") == "BUY"]
 
 
-# =============================================================================
-# Top Header & Tune Popover
-# =============================================================================
-c1, c2 = st.columns([3, 1])
-with c1:
-    st.markdown("## 🏀 Kalshi NBA")
-with c2:
-    with st.popover("⚙️ Tune"):
+# --- Top Bar ---
+top_l, top_r = st.columns([3, 1])
+with top_l:
+    st.title("🏀 Kalshi NBA")
+with top_r:
+    st.write("")
+    with st.popover("⚙️ Tune", use_container_width=True):
         bankroll_val = st.number_input("Fake Bankroll ($)", 10.0, 50000.0, float(config.PAPER_BANKROLL), 25.0)
         min_edge_val = st.slider("Min Edge (%)", 0.5, 15.0, float(config.MIN_NET_EDGE * 100), 0.5)
         kelly_val = st.slider("Bet Size (Kelly)", 0.05, 1.0, float(config.KELLY_FRACTION), 0.05)
@@ -143,15 +80,14 @@ with c2:
         config.MIN_NET_EDGE = Decimal(str(min_edge_val)) / Decimal("100")
         config.KELLY_FRACTION = Decimal(str(kelly_val))
 
-# =============================================================================
-# Mode Switcher
-# =============================================================================
-mode = st.radio(
+# --- Mode Switcher ---
+mode = st.segmented_control(
     "Mode",
     ["Offline Demo", "Live Prices (Paper)"],
-    horizontal=True,
+    default="Offline Demo",
     label_visibility="collapsed",
-)
+) or "Offline Demo"
+
 is_mock = mode == "Offline Demo"
 config.DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -170,30 +106,18 @@ if reset_btn:
     st.session_state.pop("detailed_buys", None)
     st.toast("Paper balance reset!", icon="✨")
 
-# =============================================================================
-# Balance Bubble Card
-# =============================================================================
+# --- Balance Bubble Card ---
 ledger = PaperLedger(ledger_path)
 acct = ledger.account(datetime.now(timezone.utc))
 
 with st.container(border=True):
-    st.markdown(
-        f"""
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-            <span style="font-size:12px; font-weight:600; color:#86868B;">PAPER BALANCE</span>
-            <span class="pill-blue">Simulated</span>
-        </div>
-        <div style="font-size:34px; font-weight:700; margin:4px 0;">${acct.cash:,.2f}</div>
-        <div style="font-size:13px; color:#6E6E73;">
-            Total Equity: <b>${acct.equity:,.2f}</b> &nbsp;•&nbsp; In Play: <b>${acct.exposure:,.2f}</b>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    b_left, b_right = st.columns([3, 1])
+    b_left.caption("PAPER BALANCE")
+    b_right.markdown(":blue-badge[Simulated]")
+    st.metric("Available Cash", f"${acct.cash:,.2f}", label_visibility="collapsed")
+    st.caption(f"Total Equity: **${acct.equity:,.2f}**  •  In Play: **${acct.exposure:,.2f}**")
 
-# =============================================================================
-# Scan Button
-# =============================================================================
+# --- Scan Button ---
 if st.button("Scan NBA Games", type="primary", use_container_width=True):
     if is_mock:
         for p in (ledger_path, risk_path):
@@ -215,15 +139,13 @@ if st.button("Scan NBA Games", type="primary", use_container_width=True):
         st.session_state["detailed_buys"] = load_run_buys(journal.csv_path, journal.run_id)
         st.rerun()
 
-# =============================================================================
-# Picks vs All Scanned
-# =============================================================================
-view = st.radio(
+# --- View Switcher ---
+view = st.segmented_control(
     "View",
     ["✨ Best Picks", "📋 All Scanned"],
-    horizontal=True,
+    default="✨ Best Picks",
     label_visibility="collapsed",
-)
+) or "✨ Best Picks"
 
 if view == "✨ Best Picks":
     buys = st.session_state.get("detailed_buys")
@@ -241,13 +163,23 @@ if view == "✨ Best Picks":
             contracts = int(_num(b.get("contracts")))
             side_label = str(b.get("side") or "yes").upper()
             team_name = b.get("team_yes") or b.get("kalshi_ticker")
-            explanation = build_explanation(b)
 
             with st.container(border=True):
-                st.markdown(
-                    f"""
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <span style="font-weight:700; font-size:18px;">{team_name}</span>
-                        <span class="pill-green">+{edge_pct:.1f}% Edge</span>
-                    </div>
-                    <div style="font-
+                c_title, c_badge = st.columns([3, 1])
+                c_title.subheader(team_name)
+                c_badge.markdown(f":green-badge[+{edge_pct:.1f}% Edge]")
+                st.caption(b.get("kalshi_ticker", ""))
+
+                c_order, c_stake = st.columns([3, 1])
+                c_order.markdown(f"Buy **{side_label}** • {contracts} contracts @ **${price_val:.2f}**")
+                c_stake.markdown(f"**${stake_val:.2f}**")
+
+                st.info(build_explanation(b), icon="💡")
+else:
+    csv_file = journal_paths[0]
+    if csv_file.exists() and csv_file.stat().st_size > 0:
+        df = pd.read_csv(csv_file)
+        clean_cols = [c for c in ["kalshi_ticker", "team_yes", "decision", "net_edge", "reason"] if c in df.columns]
+        st.dataframe(df[clean_cols].tail(25), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No scan history yet.")
