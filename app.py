@@ -5,7 +5,7 @@ from decimal import Decimal
 import pandas as pd
 import streamlit as st
 
-# 1. Load Streamlit Cloud Secrets into env vars before importing config
+# Load Streamlit Secrets if present
 try:
     for k, v in st.secrets.items():
         if isinstance(v, str):
@@ -19,91 +19,133 @@ from kalshi_client import KalshiClient
 from main import build_mock_world, run_scan
 from odds_client import OddsAPIClient
 
-st.set_page_config(
-    page_title="Kalshi NBA +EV Research Dashboard",
-    page_icon="🏀",
-    layout="wide",
-)
-
-# Force simulation safety lock in the UI
+st.set_page_config(page_title="Kalshi NBA", page_icon="🏀", layout="centered")
 config.DRY_RUN = True
 
 # =============================================================================
-# Sidebar: Simulation & Strategy Controls
+# Apple / iOS Bubble Styling
 # =============================================================================
-with st.sidebar:
-    st.header("⚙️ Strategy Controls")
-    st.caption("Adjust parameters before running a simulated scan.")
+st.markdown(
+    """
+    <style>
+    /* Soft iOS System Gray background & San Francisco font stack */
+    .stApp {
+        background-color: #F5F5F7;
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif;
+        color: #1D1D1F;
+    }
+    /* Hide Streamlit header/footer clutter */
+    header[data-testid="stHeader"], footer { visibility: hidden; }
+    .block-container { max-width: 680px; padding-top: 2rem; padding-bottom: 3rem; }
 
-    data_mode = st.radio(
-        "Data Source",
-        ["Offline Mock Games", "Live Odds + Kalshi Books"],
-        help="Offline Mock uses built-in synthetic NBA scenarios. Live fetches real market prices in DRY_RUN mode.",
-    )
+    /* Floating white iOS bubble cards */
+    .ios-card {
+        background: #FFFFFF;
+        border-radius: 22px;
+        padding: 20px 22px;
+        margin-bottom: 14px;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.04);
+        border: 1px solid rgba(0, 0, 0, 0.03);
+    }
+    .ios-label {
+        font-size: 12px;
+        font-weight: 600;
+        color: #86868B;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        margin-bottom: 4px;
+    }
+    .ios-big-num {
+        font-size: 34px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        color: #1D1D1F;
+        line-height: 1.1;
+    }
+    .ios-sub {
+        font-size: 13px;
+        color: #86868B;
+        margin-top: 6px;
+    }
 
-    st.divider()
-    st.subheader("Bankroll & Sizing")
-    paper_bankroll = st.number_input(
-        "Starting Paper Bankroll ($)",
-        min_value=10.0,
-        max_value=100000.0,
-        value=float(config.PAPER_BANKROLL),
-        step=25.0,
-    )
-    kelly_fraction = st.slider(
-        "Kelly Fraction",
-        min_value=0.05,
-        max_value=1.00,
-        value=float(config.KELLY_FRACTION),
-        step=0.05,
-        help="0.25 = Quarter Kelly (recommended to reduce variance).",
-    )
+    /* Pill badges */
+    .pill-blue {
+        display: inline-block;
+        background: #E8F2FF;
+        color: #007AFF;
+        font-weight: 600;
+        font-size: 12px;
+        padding: 4px 12px;
+        border-radius: 999px;
+    }
+    .pill-green {
+        display: inline-block;
+        background: #E6F8EC;
+        color: #248A3D;
+        font-weight: 600;
+        font-size: 12px;
+        padding: 4px 12px;
+        border-radius: 999px;
+    }
 
-    st.divider()
-    st.subheader("Entry Gates")
-    min_edge_pct = st.slider(
-        "Minimum Net Edge (%)",
-        min_value=0.5,
-        max_value=15.0,
-        value=float(config.MIN_NET_EDGE * 100),
-        step=0.5,
-    )
-    max_spread = st.slider(
-        "Max Bid-Ask Spread ($)",
-        min_value=0.01,
-        max_value=0.20,
-        value=float(config.MAX_SPREAD),
-        step=0.01,
-    )
-    devig_method = st.selectbox(
-        "Devigging Formula",
-        ["power", "shin", "multiplicative"],
-        index=["power", "shin", "multiplicative"].index(config.DEVIG_METHOD),
-    )
-    max_book_age = st.slider(
-        "Max Sportsbook Quote Age (sec)",
-        min_value=30,
-        max_value=900,
-        value=int(config.MAX_BOOK_UPDATE_AGE_SECONDS),
-        step=30,
-    )
-
-    # Apply UI controls to config using exact Decimal types
-    config.PAPER_BANKROLL = Decimal(str(paper_bankroll))
-    config.KELLY_FRACTION = Decimal(str(kelly_fraction))
-    config.MIN_NET_EDGE = Decimal(str(min_edge_pct)) / Decimal("100")
-    config.MAX_SPREAD = Decimal(str(max_spread))
-    config.DEVIG_METHOD = devig_method
-    config.MAX_BOOK_UPDATE_AGE_SECONDS = int(max_book_age)
-
-    st.divider()
-    reset_clicked = st.button("🔄 Reset Paper Ledger", use_container_width=True)
+    /* Apple Blue pill buttons */
+    div.stButton > button[kind="primary"] {
+        background-color: #007AFF;
+        color: white;
+        border: none;
+        border-radius: 999px;
+        padding: 0.65rem 1.5rem;
+        font-weight: 600;
+        font-size: 16px;
+        box-shadow: 0 4px 14px rgba(0, 122, 255, 0.28);
+        transition: all 0.15s ease;
+    }
+    div.stButton > button[kind="primary"]:hover {
+        background-color: #0066D6;
+        transform: translateY(-1px);
+    }
+    div[data-testid="stPopover"] > button {
+        border-radius: 999px;
+        background: #FFFFFF;
+        border: 1px solid rgba(0,0,0,0.08);
+        color: #1D1D1F;
+        font-weight: 500;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # =============================================================================
-# File paths for selected mode
+# Top Bar: Title + Minimal Settings Popover (No Sidebar!)
 # =============================================================================
+top_left, top_right = st.columns([3, 1])
+with top_left:
+    st.markdown("## 🏀 Kalshi NBA")
+with top_right:
+    with st.popover("⚙️ Tune"):
+        st.markdown("**Paper Settings**")
+        bankroll_val = st.number_input("Fake Bankroll ($)", 10.0, 50000.0, float(config.PAPER_BANKROLL), 25.0)
+        min_edge_val = st.slider("Min Edge (%)", 0.5, 15.0, float(config.MIN_NET_EDGE * 100), 0.5)
+        kelly_val = st.slider("Bet Size (Kelly)", 0.05, 1.0, float(config.KELLY_FRACTION), 0.05)
+        reset_btn = st.button("Reset Paper Balance", use_container_width=True)
+
+        config.PAPER_BANKROLL = Decimal(str(bankroll_val))
+        config.MIN_NET_EDGE = Decimal(str(min_edge_val)) / Decimal("100")
+        config.KELLY_FRACTION = Decimal(str(kelly_val))
+
+# =============================================================================
+# iOS Segmented Mode Switcher
+# =============================================================================
+mode = st.segmented_control(
+    "Data Source",
+    ["Offline Demo", "Live Prices (Paper)"],
+    default="Offline Demo",
+    label_visibility="collapsed",
+) or "Offline Demo"
+
+is_mock = mode == "Offline Demo"
 config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-is_mock = data_mode.startswith("Offline")
 
 if is_mock:
     journal_paths = (config.DATA_DIR / "mock_trade_journal.csv", config.DATA_DIR / "mock_trade_journal.jsonl")
@@ -114,133 +156,119 @@ else:
     risk_path = config.RISK_STATE_PATH
     ledger_path = config.PAPER_LEDGER_PATH
 
-if reset_clicked:
-    for path in (ledger_path, risk_path, *journal_paths):
-        path.unlink(missing_ok=True)
-    st.toast("Paper ledger and trade history cleared!", icon="✅")
+if reset_btn:
+    for p in (ledger_path, risk_path, *journal_paths):
+        p.unlink(missing_ok=True)
+    st.toast("Paper balance reset!", icon="✨")
 
 # =============================================================================
-# Header & Top KPI Metrics
+# Balance Bubble Card (Apple Wallet Style)
 # =============================================================================
-st.title("🏀 Kalshi NBA +EV Research Terminal")
-st.caption(
-    f"Mode: **SIMULATION (DRY_RUN)** | Kalshi Env: `{config.KALSHI_ENV}` | "
-    f"Devig: `{config.DEVIG_METHOD}` | Min Edge: `{min_edge_pct:.1f}%`"
-)
-
 ledger = PaperLedger(ledger_path)
 acct = ledger.account(datetime.now(timezone.utc))
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Paper Equity", f"${acct.equity:,.2f}")
-m2.metric("Available Cash", f"${acct.cash:,.2f}")
-m3.metric("Open Simulated Exposure", f"${acct.exposure:,.2f}")
-m4.metric("Active Simulated Games", len(acct.events))
-
-st.divider()
+st.markdown(
+    f"""
+    <div class="ios-card">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+            <span class="ios-label">Paper Balance</span>
+            <span class="pill-blue">Simulated</span>
+        </div>
+        <div class="ios-big-num">${acct.cash:,.2f}</div>
+        <div class="ios-sub">
+            Total Equity: <b>${acct.equity:,.2f}</b> &nbsp;•&nbsp; In Play: <b>${acct.exposure:,.2f}</b>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 # =============================================================================
-# Action Bar
+# Big Pill Scan Button
 # =============================================================================
-col_btn, col_info = st.columns([1, 3])
-with col_btn:
-    run_clicked = st.button("▶️ Run Market Scan", type="primary", use_container_width=True)
-with col_info:
+if st.button("Scan NBA Games", type="primary", use_container_width=True):
     if is_mock:
-        st.info("Running against 8 built-in synthetic NBA matchups (no API keys required).")
-    else:
-        st.warning("Live Data Mode: fetches real Odds API lines & Kalshi order books, but only places simulated paper trades.")
-
-if run_clicked:
-    # Fresh mock sandbox per scan so you can repeatedly test slider changes
-    if is_mock:
-        for path in (ledger_path, risk_path):
-            path.unlink(missing_ok=True)
+        for p in (ledger_path, risk_path):
+            p.unlink(missing_ok=True)
         kalshi, fetch_snapshot = build_mock_world()
     else:
         problems = config.validate_config()
         if problems:
-            st.error("Missing or invalid configuration:\n- " + "\n- ".join(problems))
+            st.error("Setup needed:\n- " + "\n- ".join(problems))
             st.stop()
         kalshi = KalshiClient()
         fetch_snapshot = OddsAPIClient().fetch_nba_odds
 
-    with st.spinner("Fetching odds, checking Kalshi order books, and calculating +EV..."):
+    with st.spinner("Checking lines..."):
         journal = TradeJournal(*journal_paths)
         risk = RiskManager(risk_path)
         ledger = PaperLedger(ledger_path)
         result = run_scan(kalshi, fetch_snapshot, journal=journal, risk=risk, ledger=ledger)
-        st.session_state["last_counts"] = dict(result["engine"].counts)
-        st.session_state["last_buys"] = result["engine"].buys
-        st.session_state["last_run_id"] = journal.run_id
+        st.session_state["buys"] = result["engine"].buys
+        st.session_state["counts"] = dict(result["engine"].counts)
         st.rerun()
 
 # =============================================================================
-# Main Dashboard Tabs
+# View Switcher: Picks vs All Games
 # =============================================================================
-tab_signals, tab_positions, tab_journal = st.tabs([
-    "🎯 Latest Scan Signals",
-    "📒 Paper Positions",
-    "📊 Full Decision Log",
-])
+view = st.segmented_control(
+    "View",
+    ["✨ Best Picks", "📋 All Scanned"],
+    default="✨ Best Picks",
+    label_visibility="collapsed",
+) or "✨ Best Picks"
 
-with tab_signals:
-    buys = st.session_state.get("last_buys", [])
-    counts = st.session_state.get("last_counts", {})
-
-    if not counts:
-        st.write("Click **▶️ Run Market Scan** above to evaluate NBA markets.")
-    else:
-        left, right = st.columns([2, 1])
-        with left:
-            st.subheader("Triggered +EV Trades")
-            if buys:
-                df_buys = pd.DataFrame([
-                    {
-                        "Ticker": b["ticker"],
-                        "Side": b["side"].upper(),
-                        "Route": b["route"],
-                        "Contracts": b["contracts"],
-                        "Limit Price": f"${float(b['price']):.2f}",
-                        "Net Edge": f"{float(b['net_edge']) * 100:.2f}%",
-                        "Max Stake": f"${float(b['stake']):.2f}",
-                    }
-                    for b in buys
-                ])
-                st.dataframe(df_buys, use_container_width=True, hide_index=True)
-            else:
-                st.info("No markets met your minimum edge, spread, and liquidity thresholds on this scan.")
-
-        with right:
-            st.subheader("Gate Breakdown")
-            df_counts = pd.DataFrame(
-                list(counts.items()), columns=["Decision", "Markets"]
-            ).set_index("Decision")
-            st.bar_chart(df_counts)
-
-with tab_positions:
-    st.subheader("Simulated Open Orders & Positions")
-    if ledger.entries:
-        df_pos = pd.DataFrame(ledger.entries)
-        st.dataframe(df_pos, use_container_width=True, hide_index=True)
-    else:
-        st.write("No simulated positions recorded yet.")
-
-with tab_journal:
-    csv_file = journal_paths[0]
-    if csv_file.exists() and csv_file.stat().st_size > 0:
-        df_journal = pd.read_csv(csv_file)
-        decisions = ["ALL"] + sorted(df_journal["decision"].dropna().unique().tolist())
-        selected_dec = st.selectbox("Filter by Gate Decision", decisions)
-        if selected_dec != "ALL":
-            df_journal = df_journal[df_journal["decision"] == selected_dec]
-
-        st.dataframe(df_journal, use_container_width=True, hide_index=True)
-        st.download_button(
-            "⬇️ Download Journal CSV",
-            data=csv_file.read_bytes(),
-            file_name=csv_file.name,
-            mime="text/csv",
+if view == "✨ Best Picks":
+    buys = st.session_state.get("buys")
+    if buys is None:
+        st.markdown(
+            """
+            <div class="ios-card" style="text-align:center; padding: 32px 20px;">
+                <div style="font-size: 28px; margin-bottom: 8px;">🏀</div>
+                <div style="font-weight: 600; font-size: 16px;">Ready to scan</div>
+                <div class="ios-sub">Tap <b>Scan NBA Games</b> above to find mispriced matchups.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    elif not buys:
+        st.markdown(
+            """
+            <div class="ios-card" style="text-align:center; padding: 28px 20px;">
+                <div style="font-weight: 600; font-size: 16px;">No strong edges right now</div>
+                <div class="ios-sub">All games were either priced fairly or had wide spreads.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
     else:
-        st.write("Run a scan to populate the audit journal.")
+        for b in buys:
+            edge_pct = float(b["net_edge"]) * 100
+            price_val = float(b["price"])
+            stake_val = float(b["stake"])
+            side_label = b["side"].upper()
+            st.markdown(
+                f"""
+                <div class="ios-card">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                        <span style="font-weight:700; font-size:17px;">{b['ticker']}</span>
+                        <span class="pill-green">+{edge_pct:.1f}% Edge</span>
+                    </div>
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <span class="ios-sub" style="margin:0;">
+                            Buy <b>{side_label}</b> • {b['contracts']} contracts @ <b>${price_val:.2f}</b>
+                        </span>
+                        <span style="font-weight:600; font-size:15px;">${stake_val:.2f}</span>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+else:
+    csv_file = journal_paths[0]
+    if csv_file.exists() and csv_file.stat().st_size > 0:
+        df = pd.read_csv(csv_file)
+        clean_cols = [c for c in ["kalshi_ticker", "team_yes", "decision", "net_edge", "reason"] if c in df.columns]
+        st.dataframe(df[clean_cols].tail(25), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No scan history yet.")
