@@ -1,5 +1,5 @@
 """
-kalshi_client.py - Kalshi Trade API client.
+kalshi_client.py - Kalshi Trade API client + market normalisation.
 
 * RSA-PSS request signing via the `cryptography` package (signs timestamp + METHOD +
   path, with the query string stripped, as Kalshi requires).
@@ -11,22 +11,34 @@ kalshi_client.py - Kalshi Trade API client.
 * Order book parsing for both the current `orderbook_fp` format (string dollars) and the
   legacy `orderbook` format (integer cents). Books contain BIDS ONLY: a YES ask is
   1 - best NO bid, and buying YES consumes resting NO bids (and vice versa).
+* Market normalisation: every enabled Kalshi series (KXNBAGAME / SPREAD / TOTAL / PTS / REB / AST /
+  3PT) is parsed into a MarketSpec carrying canonical SelectionKeys (team code, normalised player
+  name, side and the EXACT point line) so the engine can match it to a sportsbook line that is
+  identical, never merely similar. Markets that cannot be parsed unambiguously are returned as
+  "unresolved" with a reason instead of being guessed at.
+* Real orders: POST /portfolio/orders signed with RSA-PSS (resting post-only maker orders and
+  fill-or-kill taker orders), plus order / market lookups used to settle trades.
 """
 from __future__ import annotations
 
 import base64
 import logging
 import random
+import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal
-from typing import Callable, Iterator
+from typing import Callable, Iterable, Iterator
 from urllib.parse import urlparse
 
 import requests
 
 import config
-from math_engine import FeeSchedule, ONE, ZERO, to_decimal
+from math_engine import (
+    FeeSchedule, ONE, ZERO, SelectionKey, canonical_team_code, is_half_line, normalize_player_name,
+    team_code_from_text, to_decimal,
+)
 
 log = logging.getLogger("kalshi_client")
 
@@ -131,6 +143,251 @@ def _dec_field(record: dict, *names: str, default: Decimal = ZERO) -> Decimal:
                 continue
     return default
 
+
+
+# =============================================================================
+# Market normalisation (Kalshi market -> canonical, comparable description)
+# =============================================================================
+_EVENT_RE = re.compile(r"^(?P<series>[A-Z0-9]+)-(?P<yy>\d{2})(?P<mon>[A-Z]{3})(?P<dd>\d{2})(?P<teams>[A-Z]{4,8})$")
+_MONTHS = {m: i for i, m in enumerate(
+    ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], start=1)}
+_SPREAD_RE = re.compile(r"(?P<team>.+?)\s+wins?\s+by\s+over\s+(?P<n>\d+(?:\.\d+)?)", re.I)
+_TOTAL_RE = re.compile(r"\bover\s+(?P<n>\d+(?:\.\d+)?)", re.I)
+_PROP_RE = re.compile(r"^\s*(?P<player>[^:]+?)\s*:\s*(?P<n>\d+(?:\.\d+)?)\s*\+")
+_PROP_PLAYER_RE = re.compile(r"^\s*(?P<player>[^:]+?)\s*:")
+
+
+def parse_event_ticker(event_ticker: str) -> tuple[date, str, str] | None:
+    """'KXNBAGAME-26NOV17LALHOU' -> (2026-11-17, 'LAL', 'HOU') (Kalshi lists the away team first)."""
+    base = "-".join(event_ticker.upper().split("-")[:2])  # tolerate extra trailing segments
+    match = _EVENT_RE.match(base)
+    if not match:
+        return None
+    month = _MONTHS.get(match["mon"])
+    if not month:
+        return None
+    try:
+        game_date = date(2000 + int(match["yy"]), month, int(match["dd"]))
+    except ValueError:
+        return None
+    teams = match["teams"]
+    for split in range(2, 5):
+        first, second = canonical_team_code(teams[:split]), canonical_team_code(teams[split:])
+        if first and second and first != second:
+            return game_date, first, second
+    return None
+
+
+def _nick(code: str) -> str:
+    return config.NBA_TEAMS[code][1]
+
+
+def _num(value) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except ArithmeticError:
+        return None
+
+
+def _price_field(raw: dict, name: str) -> Decimal | None:
+    """Quote from a /markets listing: '<name>_dollars' (string dollars) else '<name>' (integer cents)."""
+    dollars = _num(raw.get(f"{name}_dollars"))
+    if dollars is not None:
+        return dollars if dollars > 0 else None
+    cents = _num(raw.get(name))
+    return cents / 100 if cents is not None and cents > 0 else None
+
+
+def top_of_book(raw: dict) -> tuple[Decimal | None, Decimal | None]:
+    """(best YES bid, best NO bid) from the quotes embedded in a market listing (may be stale)."""
+    yes_bid = _price_field(raw, "yes_bid")
+    no_bid = _price_field(raw, "no_bid")
+    if no_bid is None:
+        yes_ask = _price_field(raw, "yes_ask")
+        no_bid = ONE - yes_ask if yes_ask is not None else None
+    if yes_bid is None:
+        no_ask = _price_field(raw, "no_ask")
+        yes_bid = ONE - no_ask if no_ask is not None else None
+    return yes_bid, no_bid
+
+
+@dataclass(frozen=True)
+class MarketSpec:
+    """A Kalshi market in canonical form. yes_key / no_key are what a sportsbook must quote to compare."""
+
+    ticker: str
+    event_ticker: str
+    series: str
+    category: str  # moneyline | spread | total | prop
+    stat: str | None  # points | rebounds | assists | threes (props only)
+    game_date: date
+    team_a: str  # Kalshi lists the away team first
+    team_b: str
+    odds_market: str  # Odds API market key that carries this line
+    yes_key: SelectionKey
+    no_key: SelectionKey
+    yes_label: str
+    no_label: str
+    title: str
+    line: Decimal | None
+    yes_bid: Decimal | None = None  # from the listing; used only to prescreen
+    no_bid: Decimal | None = None
+    raw: dict = field(default_factory=dict, compare=False, hash=False, repr=False)
+
+    @property
+    def game_code(self) -> str:
+        return self.event_ticker.split("-")[1] if "-" in self.event_ticker else self.event_ticker
+
+    @property
+    def group(self) -> str:
+        """Exposure group: the ticker minus its final segment (game for ML/spread/total, player for props)."""
+        return self.ticker.rsplit("-", 1)[0]
+
+
+def _reconcile(candidates: list[Decimal | None], what: str) -> tuple[Decimal | None, str]:
+    values = [c for c in candidates if c is not None]
+    if not values:
+        return None, f"no {what} found in title or strike fields"
+    if any(v != values[0] for v in values):
+        return None, f"conflicting {what} values {sorted(set(map(str, values)))}"
+    if not is_half_line(values[0]):
+        return None, f"{what} {values[0]} is not a half-point line"
+    return values[0], ""
+
+
+def parse_market(raw: dict) -> tuple[MarketSpec | None, str]:
+    """Normalise one raw Kalshi market. Returns (spec, "") or (None, reason it could not be matched safely)."""
+    ticker = raw.get("ticker") or ""
+    event_ticker = raw.get("event_ticker") or ticker.rsplit("-", 1)[0]
+    series = event_ticker.split("-")[0]
+    category = config.series_category(series)
+    if not ticker or category is None:
+        return None, f"unrecognised series '{series}'"
+    info = parse_event_ticker(event_ticker)
+    if info is None:
+        return None, f"cannot read game/teams from event ticker {event_ticker}"
+    game_date, team_a, team_b = info
+    title = (raw.get("title") or "").strip()
+    yes_sub = (raw.get("yes_sub_title") or "").strip()
+    text = yes_sub or title
+    floor = _num(raw.get("floor_strike"))
+    strike_type = str(raw.get("strike_type") or "").lower()
+    yes_bid, no_bid = top_of_book(raw)
+    suffix = ticker.rsplit("-", 1)[-1]
+
+    def make(odds_market, yes_key, no_key, yes_label, no_label, label, line, stat=None) -> MarketSpec:
+        return MarketSpec(ticker, event_ticker, series, category, stat, game_date, team_a, team_b, odds_market,
+                          yes_key, no_key, yes_label, no_label, label, line, yes_bid, no_bid, raw)
+
+    if category == "moneyline":
+        code = canonical_team_code(suffix) or team_code_from_text(yes_sub) or team_code_from_text(title)
+        if code not in (team_a, team_b):
+            return None, f"cannot tell which team the YES side wins for ({text or suffix})"
+        other = team_b if code == team_a else team_a
+        return make("h2h", SelectionKey("h2h", code, "win", None), SelectionKey("h2h", other, "win", None),
+                    f"{_nick(code)} to win", f"{_nick(other)} to win", f"{_nick(code)} moneyline", None), ""
+
+    if category == "spread":
+        match = _SPREAD_RE.search(text) or _SPREAD_RE.search(title)
+        team_text = match["team"] if match else ""
+        code = team_code_from_text(team_text)
+        if code is None:  # fall back to the letters at the start of the ticker suffix, e.g. "LAL5"
+            letters = re.match(r"[A-Z]+", suffix)
+            code = canonical_team_code(letters.group(0)) if letters else None
+        if code not in (team_a, team_b):
+            return None, f"cannot tell which team the spread belongs to ({text})"
+        line, why = _reconcile([_num(match["n"]) if match else None, floor], "spread")
+        if line is None:
+            return None, why
+        other = team_b if code == team_a else team_a
+        return make("spreads", SelectionKey("spreads", code, "cover", -line), SelectionKey("spreads", other, "cover", line),
+                    f"{_nick(code)} -{line}", f"{_nick(other)} +{line}", f"{_nick(code)} -{line} spread", line), ""
+
+    if category == "total":
+        match = _TOTAL_RE.search(text) or _TOTAL_RE.search(title)
+        line, why = _reconcile([_num(match["n"]) if match else None, floor], "total")
+        if line is None:
+            return None, why
+        return make("totals", SelectionKey("totals", "game", "over", line), SelectionKey("totals", "game", "under", line),
+                    f"Over {line}", f"Under {line}", f"Total points {line}", line), ""
+
+    # ---- player props
+    stat = config.series_stat(series)
+    if stat is None:
+        return None, f"no prop stat configured for series {series}"
+    match = _PROP_RE.match(text) or _PROP_RE.match(title)
+    name_match = match or _PROP_PLAYER_RE.match(text) or _PROP_PLAYER_RE.match(title)
+    if name_match is None:
+        return None, f"cannot read the player name from '{text or title}'"
+    display = name_match["player"].strip()
+    player = normalize_player_name(display)
+    if not player:
+        return None, "empty player name"
+    from_plus = _num(match["n"]) - Decimal("0.5") if match else None  # "25+" means 25 or more = over 24.5
+    from_floor = None
+    if floor is not None:
+        if is_half_line(floor):
+            from_floor = floor
+        elif strike_type in ("greater_or_equal", "greater_than_or_equal"):
+            from_floor = floor - Decimal("0.5")
+        elif strike_type == "greater":
+            from_floor = floor + Decimal("0.5")
+    line, why = _reconcile([from_plus, from_floor], "prop line")
+    if line is None:
+        return None, why
+    market = config.PROP_STATS[stat]["odds_market"]
+    label = config.PROP_STATS[stat]["label"].lower()
+    return make(market, SelectionKey(market, player, "over", line), SelectionKey(market, player, "under", line),
+                f"{display} Over {line} {label}", f"{display} Under {line} {label}",
+                f"{display} {label} {line}", line, stat), ""
+
+
+@dataclass
+class KalshiScan:
+    specs: list[MarketSpec] = field(default_factory=list)
+    unresolved: list[tuple[dict, str]] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    raw_counts: dict[str, int] = field(default_factory=dict)
+
+
+# =============================================================================
+# Orders and settlement helpers
+# =============================================================================
+@dataclass(frozen=True)
+class OrderSummary:
+    status: str  # resting | canceled | executed | ...
+    filled: Decimal  # contracts filled so far
+    remaining: Decimal
+    cost: Decimal  # dollars paid for the filled contracts (excluding fees)
+    fees: Decimal  # dollars of fees on the fills
+
+
+def summarize_order(order: dict) -> OrderSummary:
+    """Read an order object (fixed-point `_fp` / `_dollars` fields preferred, integer cents as fallback)."""
+    def dollars(*names: str) -> Decimal:
+        for name in names:
+            if order.get(f"{name}_dollars") is not None:
+                return _dec_field(order, f"{name}_dollars")
+        return sum((_dec_field(order, name) / 100 for name in names), ZERO)
+
+    return OrderSummary(
+        status=str(order.get("status") or "").lower(),
+        filled=_dec_field(order, "fill_count_fp", "fill_count"),
+        remaining=_dec_field(order, "remaining_count_fp", "remaining_count"),
+        cost=dollars("taker_fill_cost", "maker_fill_cost"),
+        fees=dollars("taker_fees", "maker_fees"),
+    )
+
+
+def settlement_result(market: dict) -> str | None:
+    """'yes' | 'no' once the market is settled/finalized, 'void' if it ended without a yes/no result, else None."""
+    status = str(market.get("status") or "").lower()
+    result = str(market.get("result") or "").lower()
+    if status not in ("settled", "finalized"):
+        return None
+    return result if result in ("yes", "no") else "void"
 
 # =============================================================================
 # Client
@@ -275,6 +532,29 @@ class KalshiClient:
         self._fee_cache[series_ticker] = schedule
         return schedule
 
+    def get_market(self, ticker: str) -> dict:
+        """Single market (public). Used to detect settlement: status settled/finalized + result yes/no."""
+        return self._request("GET", f"/markets/{ticker}").get("market") or {}
+
+    def get_specs(self, categories: Iterable[str]) -> KalshiScan:
+        """Fetch every enabled Kalshi series and normalise the markets. One failing series never aborts the scan."""
+        scan = KalshiScan()
+        for category in categories:
+            for series in config.kalshi_series_for(category):
+                try:
+                    raw_markets = self.get_markets(series)
+                except Exception as exc:  # noqa: BLE001 - report, keep scanning other series
+                    scan.errors.append(f"{series}: {exc}")
+                    continue
+                scan.raw_counts[series] = len(raw_markets)
+                for raw in raw_markets:
+                    spec, why = parse_market(raw)
+                    if spec is not None:
+                        scan.specs.append(spec)
+                    else:
+                        scan.unresolved.append((raw, why))
+        return scan
+
     # ------------------------------------------------------------------ account (authenticated)
     def get_balance(self) -> dict[str, Decimal]:
         """Returns {'cash': available balance, 'portfolio_value': value of positions} in dollars."""
@@ -338,6 +618,7 @@ class KalshiClient:
         Buy `count` contracts of `side` ('yes'/'no') with a limit order at `price` dollars.
         Maker orders pass post_only=True (rejected rather than crossing the spread).
         Taker orders pass fill_or_kill=True (all-or-nothing at the limit price).
+        The request is signed with RSA-PSS (see _auth_headers) and sent to POST {base}/portfolio/orders.
         A fixed client_order_id makes retries after a network failure safe; a 409 means the
         order was already accepted.
         """
@@ -364,6 +645,10 @@ class KalshiClient:
             if exc.status == 409:
                 return {"duplicate_client_order_id": True, "client_order_id": client_order_id, "error": exc.body}
             raise
+
+    def get_order(self, order_id: str) -> dict:
+        """One order (authenticated): status, fill_count, fill costs and fees."""
+        return self._request("GET", f"/portfolio/orders/{order_id}", require_auth=True).get("order") or {}
 
     def cancel_order(self, order_id: str) -> dict:
         return self._request("DELETE", f"/portfolio/orders/{order_id}", require_auth=True)
