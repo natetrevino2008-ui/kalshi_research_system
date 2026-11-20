@@ -1,3 +1,4 @@
+Ini, TOML
 [theme]
-font = "monospace"
-headingFont = "sans-serif"
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap"
+headingFont = "Space Grotesk:https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@700&display=swap"
