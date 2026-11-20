@@ -5,16 +5,20 @@ No network, no file I/O, no clocks: every function is deterministic so it can be
 tested offline.
 
 Sections
+    0. Name and line normalisation (teams, players, point lines) - the "apples to apples" layer
     1. Odds conversion and devigging (multiplicative, power, Shin)
     2. Multi-book weighted consensus
     3. Kalshi fee model (taker vs maker, per-series fee type)
     4. Net edge, Kelly fraction, and position sizing
+    5. Two-sided pricing (maker / taker edge) and settlement payout
 """
 from __future__ import annotations
 
+import re
+import unicodedata
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
-from typing import Iterable, Mapping, Sequence
+from typing import Iterable, Mapping, NamedTuple, Sequence
 
 import config
 
@@ -33,6 +37,96 @@ def to_decimal(value) -> Decimal:
 
 def ceil_to_cent(value: Decimal) -> Decimal:
     return value.quantize(CENT, rounding=ROUND_CEILING)
+
+
+# =============================================================================
+# 0. Name and line normalisation
+# =============================================================================
+class SelectionKey(NamedTuple):
+    """
+    Canonical identity of ONE side of a two-way market, identical on the Kalshi and Odds API sides:
+
+        h2h               ("h2h",            "LAL",          "win",   None)
+        spread            ("spreads",        "LAL",          "cover", Decimal("-4.5"))   # LAL -4.5
+        total             ("totals",         "game",         "over",  Decimal("224.5"))
+        player prop       ("player_points",  "lebron james", "over",  Decimal("25.5"))
+
+    Two quotes are comparable only when their keys are EQUAL, i.e. same market, same team/player,
+    same side and exactly the same point line. Decimal equality ignores trailing zeros.
+    """
+
+    market: str
+    subject: str
+    side: str
+    line: Decimal | None
+
+
+def canonical_team_code(code: str) -> str | None:
+    """Kalshi/odds-site 2-4 letter team code -> canonical 3-letter code, or None."""
+    code = code.upper()
+    code = config.NBA_TEAM_CODE_ALIASES.get(code, code)
+    return code if code in config.NBA_TEAMS else None
+
+
+def team_code_from_text(text: str | None) -> str | None:
+    """
+    Resolve free text ("Los Angeles Lakers", "Los Angeles L", "Oklahoma City", "Thunder") to a code.
+    Order: explicit aliases -> nickname anywhere -> city prefix (the two LA teams are ambiguous by city).
+    """
+    if not text:
+        return None
+    low = re.sub(r"\s+", " ", text.lower()).strip()
+    for alias, code in config.TEAM_TEXT_ALIASES.items():
+        if low.startswith(alias):
+            return code
+    for code, (_city, nickname) in config.NBA_TEAMS.items():
+        if re.search(r"\b" + re.escape(nickname.lower()) + r"\b", low):
+            return code
+    matches = [
+        code for code, (city, _nick) in config.NBA_TEAMS.items()
+        if city != "Los Angeles" and low.startswith(city.lower())
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+_NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv"}
+
+
+def normalize_player_name(name: str | None) -> str:
+    """'Alperen Şengün' -> 'alperen sengun';  "De'Aaron Fox" -> 'deaaron fox';  'Jaren Jackson Jr.' -> 'jaren jackson'."""
+    if not name:
+        return ""
+    text = unicodedata.normalize("NFKD", name)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch)).lower()
+    text = re.sub(r"[.'\u2019`]", "", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text).strip()
+    return " ".join(part for part in text.split() if part not in _NAME_SUFFIXES)
+
+
+def players_match(a: str, b: str) -> bool:
+    """Exact normalised match, or same surname with one first name a prefix of the other (nic / nicolas)."""
+    if a == b:
+        return True
+    ta, tb = a.split(), b.split()
+    if len(ta) < 2 or len(tb) < 2 or ta[-1] != tb[-1]:
+        return False
+    first_a, first_b = ta[0], tb[0]
+    short, long_ = sorted((first_a, first_b), key=len)
+    return len(short) >= 3 and long_.startswith(short)
+
+
+def resolve_player(target: str, candidates: Iterable[str]) -> str | None:
+    """Pick the one candidate that is the same player as `target` (exact first, then tolerant)."""
+    pool = list(candidates)
+    if target in pool:
+        return target
+    hits = [c for c in pool if players_match(target, c)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def is_half_line(line: Decimal) -> bool:
+    """True for x.5 lines. Integer lines can push, so they are not comparable to Kalshi's binary markets."""
+    return line % 1 == Decimal("0.5")
 
 
 # =============================================================================
@@ -147,10 +241,11 @@ def build_consensus(
     method: str | None = None,
 ) -> Consensus | None:
     """
-    book_prices: iterable of (book_key, {team_name: american_price}) for ONE game.
-    Each book is devigged on its own, then the books are combined with sharp-weighted
-    averaging. Books that do not quote exactly the two expected teams are ignored.
-    Returns None if no usable book exists.
+    book_prices: iterable of (book_key, {outcome_name: american_price}) for ONE market line.
+    The two outcome names are arbitrary labels (TrueLine passes ("yes", "no"), already mapped to the
+    Kalshi YES / NO sides by exact SelectionKey match). Each book is devigged on its own, then the
+    books are combined with sharp-weighted averaging. Books that do not quote both outcomes are
+    ignored. Returns None if no usable book exists.
     """
     team_a, team_b = team_names
     rows: list[tuple[str, Decimal, Decimal]] = []  # (book_key, weight, p_team_a)
@@ -304,3 +399,32 @@ def size_order(
         budget=budget,
         binding_cap=binding_cap,
     )
+
+
+# =============================================================================
+# 5. Two-sided pricing and settlement
+# =============================================================================
+def price_sides(
+    fair_yes: Decimal, yes_bid: Decimal, no_bid: Decimal, schedule: FeeSchedule
+) -> list[dict]:
+    """
+    Price both sides of one Kalshi market from its best bids (asks are 1 - opposite bid).
+    For each side: the resting maker price (best bid + improvement, never crossing the ask) with its
+    fee-adjusted maker edge, and the taker edge for lifting the ask immediately.
+    """
+    out: list[dict] = []
+    for side, bid, opposite_bid in (("yes", yes_bid, no_bid), ("no", no_bid, yes_bid)):
+        fair = fair_yes if side == "yes" else ONE - fair_yes
+        ask = ONE - opposite_bid
+        maker_price = min(bid + config.MAKER_PRICE_IMPROVEMENT, ask - config.TICK)
+        maker_price = min(max(maker_price, config.TICK), ONE - config.TICK)
+        maker_edge = net_edge(fair, maker_price, fee_per_contract_continuous(maker_price, "maker", schedule))
+        taker_edge = net_edge(fair, ask, fee_per_contract_continuous(ask, "taker", schedule))
+        out.append({"side": side, "fair": fair, "bid": bid, "ask": ask, "maker_price": maker_price,
+                    "maker_edge": maker_edge, "taker_edge": taker_edge})
+    return out
+
+
+def settle_payout(side: str, result: str, filled) -> Decimal:
+    """Cash returned when a market settles: $1 per filled contract on the winning side, else 0."""
+    return Decimal(str(filled)) if result == side else ZERO
