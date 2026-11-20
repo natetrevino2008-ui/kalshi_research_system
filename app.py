@@ -15,13 +15,31 @@ try:
 except Exception:
     pass
 
-import config
-from execution_engine import (
-    RiskManager, TradeJournal, TradeLedger, build_live_account, execute_paper, place_live_order,
-)
-from kalshi_client import KalshiClient
-from main import make_world, run_scan, settle_scope
-from odds_client import OddsAPIError
+# The seven files (app, config, kalshi_client, odds_client, math_engine, execution_engine, main) are
+# versioned together. If one in your repo is still an older copy, say so here: Streamlit Cloud redacts
+# import errors, which makes this otherwise impossible to diagnose.
+_REQUIRED_CONFIG = ("MODE_LABELS", "CATEGORIES", "mode_paths", "enabled_categories", "validate_config",
+                    "live_credential_problems", "PAPER_DATA_BASE_URL", "TRADE_LEDGER_PATH", "estimate_credits")
+try:
+    import config
+    _stale = [f"config.py is missing {name}" for name in _REQUIRED_CONFIG if not hasattr(config, name)]
+    if _stale:
+        raise ImportError("; ".join(_stale))
+    from execution_engine import (
+        RiskManager, TradeJournal, TradeLedger, build_live_account, execute_paper, place_live_order,
+    )
+    from kalshi_client import KalshiClient
+    from main import make_world, run_scan, settle_scope
+    from odds_client import OddsAPIError
+except ImportError as _exc:
+    st.error(
+        "**TrueLine can't start because the files in your repo don't match each other.**\n\n"
+        f"Details: `{_exc}`\n\n"
+        "Replace **all seven** files together (`app.py`, `config.py`, `kalshi_client.py`, `odds_client.py`, "
+        "`math_engine.py`, `execution_engine.py`, `main.py`), commit, then reboot the app. "
+        "A file that still has the old code (for example an `execution_engine.py` without `TradeLedger`) causes this."
+    )
+    st.stop()
 
 st.set_page_config(page_title="TrueLine", page_icon="📈", layout="centered")
 
