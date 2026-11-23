@@ -3,17 +3,10 @@ math_engine.py - Pure pricing / fee / sizing math. Everything is decimal.Decimal
 
 No network, no file I/O, no clocks: every function is deterministic so it can be unit
 tested offline.
-
-Sections
-    0. Name and line normalisation (teams, players, point lines) - the "apples to apples" layer
-    1. Odds conversion and devigging (multiplicative, power, Shin)
-    2. Multi-book weighted consensus
-    3. Kalshi fee model (taker vs maker, per-series fee type)
-    4. Net edge, Kelly fraction, and position sizing
-    5. Two-sided pricing (maker / taker edge) and settlement payout
 """
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -43,18 +36,6 @@ def ceil_to_cent(value: Decimal) -> Decimal:
 # 0. Name and line normalisation
 # =============================================================================
 class SelectionKey(NamedTuple):
-    """
-    Canonical identity of ONE side of a two-way market, identical on the Kalshi and Odds API sides:
-
-        h2h               ("h2h",            "LAL",          "win",   None)
-        spread            ("spreads",        "LAL",          "cover", Decimal("-4.5"))   # LAL -4.5
-        total             ("totals",         "game",         "over",  Decimal("224.5"))
-        player prop       ("player_points",  "lebron james", "over",  Decimal("25.5"))
-
-    Two quotes are comparable only when their keys are EQUAL, i.e. same market, same team/player,
-    same side and exactly the same point line. Decimal equality ignores trailing zeros.
-    """
-
     market: str
     subject: str
     side: str
@@ -62,17 +43,12 @@ class SelectionKey(NamedTuple):
 
 
 def canonical_team_code(code: str) -> str | None:
-    """Kalshi/odds-site 2-4 letter team code -> canonical 3-letter code, or None."""
     code = code.upper()
     code = config.NBA_TEAM_CODE_ALIASES.get(code, code)
     return code if code in config.NBA_TEAMS else None
 
 
 def team_code_from_text(text: str | None) -> str | None:
-    """
-    Resolve free text ("Los Angeles Lakers", "Los Angeles L", "Oklahoma City", "Thunder") to a code.
-    Order: explicit aliases -> nickname anywhere -> city prefix (the two LA teams are ambiguous by city).
-    """
     if not text:
         return None
     low = re.sub(r"\s+", " ", text.lower()).strip()
@@ -93,7 +69,6 @@ _NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv"}
 
 
 def normalize_player_name(name: str | None) -> str:
-    """'Alperen Şengün' -> 'alperen sengun';  "De'Aaron Fox" -> 'deaaron fox';  'Jaren Jackson Jr.' -> 'jaren jackson'."""
     if not name:
         return ""
     text = unicodedata.normalize("NFKD", name)
@@ -104,7 +79,6 @@ def normalize_player_name(name: str | None) -> str:
 
 
 def players_match(a: str, b: str) -> bool:
-    """Exact normalised match, or same surname with one first name a prefix of the other (nic / nicolas)."""
     if a == b:
         return True
     ta, tb = a.split(), b.split()
@@ -116,7 +90,6 @@ def players_match(a: str, b: str) -> bool:
 
 
 def resolve_player(target: str, candidates: Iterable[str]) -> str | None:
-    """Pick the one candidate that is the same player as `target` (exact first, then tolerant)."""
     pool = list(candidates)
     if target in pool:
         return target
@@ -125,7 +98,6 @@ def resolve_player(target: str, candidates: Iterable[str]) -> str | None:
 
 
 def is_half_line(line: Decimal) -> bool:
-    """True for x.5 lines. Integer lines can push, so they are not comparable to Kalshi's binary markets."""
     return line % 1 == Decimal("0.5")
 
 
@@ -133,7 +105,6 @@ def is_half_line(line: Decimal) -> bool:
 # 1. Odds conversion and devigging
 # =============================================================================
 def american_to_implied_prob(american_odds) -> Decimal:
-    """American odds -> raw implied probability (still containing the bookmaker's vig)."""
     odds = to_decimal(american_odds)
     if odds == 0 or (-100 < odds < 100):
         raise ValueError(f"Invalid American odds: {american_odds}")
@@ -143,7 +114,6 @@ def american_to_implied_prob(american_odds) -> Decimal:
 
 
 def devig_multiplicative(implied: Sequence[Decimal]) -> list[Decimal]:
-    """Proportional normalisation: p_i = q_i / sum(q)."""
     total = sum(implied, ZERO)
     if total <= 0:
         raise ValueError("Implied probabilities must sum to a positive number.")
@@ -151,12 +121,8 @@ def devig_multiplicative(implied: Sequence[Decimal]) -> list[Decimal]:
 
 
 def devig_power(implied: Sequence[Decimal]) -> list[Decimal]:
-    """
-    Power method: find k >= 1 such that sum(q_i ** k) == 1, then p_i = q_i ** k.
-    Takes proportionally more margin off longshots than the multiplicative method.
-    """
     total = sum(implied, ZERO)
-    if total <= 1:  # no overround (or underround): nothing to strip
+    if total <= 1:
         return devig_multiplicative(implied)
 
     def excess(k: Decimal) -> Decimal:
@@ -176,15 +142,10 @@ def devig_power(implied: Sequence[Decimal]) -> list[Decimal]:
     k = (lo + hi) / 2
     powered = [q**k for q in implied]
     norm = sum(powered, ZERO)
-    return [p / norm for p in powered]  # tiny renormalisation removes bisection residue
+    return [p / norm for p in powered]
 
 
 def devig_shin(implied: Sequence[Decimal]) -> list[Decimal]:
-    """
-    Shin (1993): models an insider-trading fraction z and solves
-        p_i = ( sqrt(z^2 + 4(1-z) q_i^2 / S) - z ) / (2(1-z)),   S = sum(q)
-    for the z that makes sum(p_i) == 1.
-    """
     total = sum(implied, ZERO)
     if total <= 1:
         return devig_multiplicative(implied)
@@ -223,11 +184,11 @@ def devig(implied: Sequence[Decimal], method: str | None = None) -> list[Decimal
 # =============================================================================
 @dataclass(frozen=True)
 class Consensus:
-    probs: dict[str, Decimal]  # team name -> consensus no-vig win probability (sums to 1)
+    probs: dict[str, Decimal]
     books_used: tuple[str, ...]
     total_weight: Decimal
-    sharp_weight_share: Decimal  # fraction of total weight contributed by sharp books
-    dispersion: Decimal  # weight-averaged std-dev of book probabilities (disagreement)
+    sharp_weight_share: Decimal
+    dispersion: Decimal
     sharp_books_used: tuple[str, ...]
 
 
@@ -240,15 +201,8 @@ def build_consensus(
     team_names: tuple[str, str],
     method: str | None = None,
 ) -> Consensus | None:
-    """
-    book_prices: iterable of (book_key, {outcome_name: american_price}) for ONE market line.
-    The two outcome names are arbitrary labels (TrueLine passes ("yes", "no"), already mapped to the
-    Kalshi YES / NO sides by exact SelectionKey match). Each book is devigged on its own, then the
-    books are combined with sharp-weighted averaging. Books that do not quote both outcomes are
-    ignored. Returns None if no usable book exists.
-    """
     team_a, team_b = team_names
-    rows: list[tuple[str, Decimal, Decimal]] = []  # (book_key, weight, p_team_a)
+    rows: list[tuple[str, Decimal, Decimal]] = []
     for book_key, prices in book_prices:
         if team_a not in prices or team_b not in prices:
             continue
@@ -282,14 +236,6 @@ def build_consensus(
 # =============================================================================
 @dataclass(frozen=True)
 class FeeSchedule:
-    """
-    Per-series fee parameters (the Kalshi series object exposes fee_type and fee_multiplier).
-        quadratic                        -> taker 0.07*M, maker 0
-        quadratic_with_maker_fees        -> taker 0.07*M, maker 0.0175*M
-        quadratic_with_combo_maker_fees  -> taker 0.07*M, maker 0.035*M
-        flat (specific fee table)        -> not modelled; treated as quadratic taker, maker 0
-    """
-
     fee_type: str = "quadratic"
     multiplier: Decimal = ONE
 
@@ -306,7 +252,6 @@ class FeeSchedule:
 
 
 def fee_total(price: Decimal, contracts: int, role: str, schedule: FeeSchedule) -> Decimal:
-    """Exact order fee in dollars: ceil_to_cent(rate * C * P * (1 - P)); zero when rate is zero."""
     rate = schedule.rate(role)
     if rate == 0 or contracts <= 0:
         return ZERO
@@ -314,12 +259,10 @@ def fee_total(price: Decimal, contracts: int, role: str, schedule: FeeSchedule) 
 
 
 def fee_per_contract_continuous(price: Decimal, role: str, schedule: FeeSchedule) -> Decimal:
-    """Unrounded per-contract fee, used for screening and Kelly before the size is known."""
     return schedule.rate(role) * price * (ONE - price)
 
 
 def fee_per_contract_exact(price: Decimal, contracts: int, role: str, schedule: FeeSchedule) -> Decimal:
-    """Per-contract fee once the order size (and therefore cent rounding) is known."""
     if contracts <= 0:
         return ZERO
     return fee_total(price, contracts, role, schedule) / contracts
@@ -329,15 +272,10 @@ def fee_per_contract_exact(price: Decimal, contracts: int, role: str, schedule: 
 # 4. Edge, Kelly, sizing
 # =============================================================================
 def net_edge(fair_prob: Decimal, price: Decimal, fee_per_contract: Decimal) -> Decimal:
-    """Net_Edge = True_Fair_Probability - (Contract_Price + Kalshi_Fee)."""
     return fair_prob - (price + fee_per_contract)
 
 
 def kelly_full_fraction(fair_prob: Decimal, cost_per_contract: Decimal) -> Decimal:
-    """
-    Full-Kelly bankroll fraction for a $1-payout binary contract bought at all-in cost c:
-        f* = (p - c) / (1 - c)      (0 when there is no edge)
-    """
     if cost_per_contract <= 0 or cost_per_contract >= ONE:
         return ZERO
     fraction = (fair_prob - cost_per_contract) / (ONE - cost_per_contract)
@@ -347,12 +285,12 @@ def kelly_full_fraction(fair_prob: Decimal, cost_per_contract: Decimal) -> Decim
 @dataclass(frozen=True)
 class SizingResult:
     contracts: int
-    total_cost: Decimal  # contracts * price + exact fee (= max loss on the bet)
+    total_cost: Decimal
     fee: Decimal
     kelly_full: Decimal
     kelly_applied: Decimal
     budget: Decimal
-    binding_cap: str  # which limit set the budget
+    binding_cap: str
 
 
 def size_order(
@@ -365,11 +303,6 @@ def size_order(
     cash_available: Decimal,
     exposure_room: Decimal,
 ) -> SizingResult:
-    """
-    Quarter-Kelly stake, then clamp by every hard cap. The budget is a max *loss*
-    (price + fee, all-in). Contracts are floored so the exact fee-inclusive cost never
-    exceeds the budget.
-    """
     unit_cost = price + fee_per_contract_continuous(price, role, schedule)
     k_full = kelly_full_fraction(fair_prob, unit_cost)
     k_applied = k_full * config.KELLY_FRACTION
@@ -407,11 +340,6 @@ def size_order(
 def price_sides(
     fair_yes: Decimal, yes_bid: Decimal, no_bid: Decimal, schedule: FeeSchedule
 ) -> list[dict]:
-    """
-    Price both sides of one Kalshi market from its best bids (asks are 1 - opposite bid).
-    For each side: the resting maker price (best bid + improvement, never crossing the ask) with its
-    fee-adjusted maker edge, and the taker edge for lifting the ask immediately.
-    """
     out: list[dict] = []
     for side, bid, opposite_bid in (("yes", yes_bid, no_bid), ("no", no_bid, yes_bid)):
         fair = fair_yes if side == "yes" else ONE - fair_yes
@@ -426,5 +354,36 @@ def price_sides(
 
 
 def settle_payout(side: str, result: str, filled) -> Decimal:
-    """Cash returned when a market settles: $1 per filled contract on the winning side, else 0."""
     return Decimal(str(filled)) if result == side else ZERO
+
+
+# =============================================================================
+# 6. Performance & Calibration Metrics
+# =============================================================================
+def brier_score(predictions_vs_outcomes: Iterable[tuple[Decimal, Decimal]]) -> Decimal | None:
+    """Mean squared difference between predicted probability and actual outcome (0 or 1). Lower is better."""
+    records = list(predictions_vs_outcomes)
+    if not records:
+        return None
+    return sum(((p - o) ** 2 for p, o in records), ZERO) / Decimal(len(records))
+
+
+def log_loss(predictions_vs_outcomes: Iterable[tuple[Decimal, Decimal]]) -> float | None:
+    """Cross-entropy loss. Lower is better."""
+    records = list(predictions_vs_outcomes)
+    if not records:
+        return None
+    loss = 0.0
+    for p, o in records:
+        # Clamp to avoid math.log(0)
+        p_float = max(1e-15, min(1 - 1e-15, float(p)))
+        o_float = float(o)
+        loss += -(o_float * math.log(p_float) + (1 - o_float) * math.log(1 - p_float))
+    return loss / len(records)
+
+
+def closing_line_value(exec_price: Decimal, closing_price: Decimal, side: str = "yes") -> Decimal:
+    """Measures edge relative to the final closing price just prior to tip-off."""
+    if exec_price <= 0:
+        return ZERO
+    return (closing_price - exec_price) / exec_price
