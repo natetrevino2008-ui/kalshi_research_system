@@ -27,7 +27,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable, Mapping, Set
 
 import requests
 
@@ -44,8 +44,12 @@ class OddsAPIError(Exception):
 
 
 def _parse_iso(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except Exception:
+        # Fallback to current UTC time if upstream sends malformed timestamps to prevent crashing
+        return datetime.now(timezone.utc)
 
 
 def _iso_z(moment: datetime) -> str:
@@ -161,9 +165,21 @@ def parse_book_market(event: OddsEvent, book: dict, market: dict) -> BookQuote |
                 selections.setdefault(SelectionKey("totals", "game", side, point), price)
     elif key.startswith("player_"):
         for outcome in outcomes:
-            side = str(outcome.get("name", "")).lower()
-            display = outcome.get("description") or ""
-            player, price, point = normalize_player_name(display), _decimal(outcome.get("price")), _decimal(outcome.get("point"))
+            # Fallback handling for books that flip name/description
+            name_val = str(outcome.get("name", "")).lower()
+            desc_val = str(outcome.get("description", ""))
+            
+            if name_val in ("over", "under"):
+                side = name_val
+                display = desc_val
+            else:
+                side = desc_val.lower()
+                display = name_val
+                
+            player = normalize_player_name(display)
+            price = _decimal(outcome.get("price"))
+            point = _decimal(outcome.get("point"))
+            
             if side in ("over", "under") and player and price is not None and point is not None:
                 selections.setdefault(SelectionKey(key, player, side, point), price)
                 event.players.setdefault(key, {})[player] = display
@@ -294,12 +310,14 @@ class OddsAPIClient:
         self,
         categories: Iterable[str] | None = None,
         event_filter: Callable[[OddsEvent], bool] | None = None,
+        target_event_ids: Set[str] | None = None,
     ) -> OddsSnapshot:
         """
         Fetch NBA odds for the enabled market categories.
 
-        categories   subset of {"moneyline","spread","total","prop"}; default = config.enabled_categories().
-        event_filter optional predicate limiting WHICH games get the (expensive) per-event prop call.
+        categories       subset of {"moneyline","spread","total","prop"}; default = config.enabled_categories().
+        event_filter     optional predicate limiting WHICH games get the (expensive) per-event prop call.
+        target_event_ids optional set of specific explicit game IDs to pull props for.
         """
         if not self.api_key:
             raise OddsAPIError("ODDS_API_KEY is not set.")
@@ -335,6 +353,10 @@ class OddsAPIClient:
             payload = response.json(parse_float=Decimal)
         events = [e for e in (parse_event(raw) for raw in payload) if e is not None]
 
+        # Filter bulk events by explicitly requested event IDs if provided
+        if target_event_ids is not None:
+            events = [e for e in events if e.event_id in target_event_ids]
+
         # ---- Step 2: per-event prop calls (only when props are enabled)
         props_fetched = 0
         if prop_markets:
@@ -350,10 +372,12 @@ class OddsAPIClient:
             skipped = 0
             for index, event in enumerate(candidates):
                 left = self.credits_remaining
-                if left is not None and left - cost_each < config.MIN_ODDS_CREDITS_REMAINING:
+                # Fix: Failsafe assumption if API removes x-requests header
+                if left is None or left - cost_each < config.MIN_ODDS_CREDITS_REMAINING:
                     skipped = len(candidates) - index
+                    left_display = left if left is not None else "Unknown"
                     warnings.append(
-                        f"Stopped fetching player props: {left} credits left (floor "
+                        f"Stopped fetching player props: {left_display} credits left (floor "
                         f"{config.MIN_ODDS_CREDITS_REMAINING}); {skipped} game(s) skipped."
                     )
                     break
