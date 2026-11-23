@@ -27,7 +27,7 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Callable, Iterable, Iterator
 from urllib.parse import urlparse
@@ -151,9 +151,13 @@ def _dec_field(record: dict, *names: str, default: Decimal = ZERO) -> Decimal:
 _EVENT_RE = re.compile(r"^(?P<series>[A-Z0-9]+)-(?P<yy>\d{2})(?P<mon>[A-Z]{3})(?P<dd>\d{2})(?P<teams>[A-Z]{4,8})$")
 _MONTHS = {m: i for i, m in enumerate(
     ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], start=1)}
-_SPREAD_RE = re.compile(r"(?P<team>.+?)\s+wins?\s+by\s+over\s+(?P<n>\d+(?:\.\d+)?)", re.I)
+
+# Fixed regex to capture both positive and negative lines, and alternate "covers" syntax
+_SPREAD_RE = re.compile(r"(?P<team>.+?)\s+(?:wins?\s+by\s+over|covers)\s+(?P<n>-?\d+(?:\.\d+)?)", re.I)
 _TOTAL_RE = re.compile(r"\bover\s+(?P<n>\d+(?:\.\d+)?)", re.I)
-_PROP_RE = re.compile(r"^\s*(?P<player>[^:]+?)\s*:\s*(?P<n>\d+(?:\.\d+)?)\s*\+")
+
+# Handles properties gracefully, tolerating spacing variations and extra wordings
+_PROP_RE = re.compile(r"^\s*(?P<player>[^:]+?)\s*:\s*(?:over\s+)?(?P<n>\d+(?:\.\d+)?)\s*\+?", re.I)
 _PROP_PLAYER_RE = re.compile(r"^\s*(?P<player>[^:]+?)\s*:")
 
 
@@ -232,6 +236,7 @@ class MarketSpec:
     no_label: str
     title: str
     line: Decimal | None
+    fetched_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc)) # Added for snapshot accuracy
     yes_bid: Decimal | None = None  # from the listing; used only to prescreen
     no_bid: Decimal | None = None
     raw: dict = field(default_factory=dict, compare=False, hash=False, repr=False)
@@ -276,10 +281,11 @@ def parse_market(raw: dict) -> tuple[MarketSpec | None, str]:
     strike_type = str(raw.get("strike_type") or "").lower()
     yes_bid, no_bid = top_of_book(raw)
     suffix = ticker.rsplit("-", 1)[-1]
+    now_utc = datetime.now(timezone.utc)
 
     def make(odds_market, yes_key, no_key, yes_label, no_label, label, line, stat=None) -> MarketSpec:
         return MarketSpec(ticker, event_ticker, series, category, stat, game_date, team_a, team_b, odds_market,
-                          yes_key, no_key, yes_label, no_label, label, line, yes_bid, no_bid, raw)
+                          yes_key, no_key, yes_label, no_label, label, line, now_utc, yes_bid, no_bid, raw)
 
     if category == "moneyline":
         code = canonical_team_code(suffix) or team_code_from_text(yes_sub) or team_code_from_text(title)
@@ -298,6 +304,8 @@ def parse_market(raw: dict) -> tuple[MarketSpec | None, str]:
             code = canonical_team_code(letters.group(0)) if letters else None
         if code not in (team_a, team_b):
             return None, f"cannot tell which team the spread belongs to ({text})"
+        
+        # Verify spread formatting consistency
         line, why = _reconcile([_num(match["n"]) if match else None, floor], "spread")
         if line is None:
             return None, why
@@ -325,7 +333,7 @@ def parse_market(raw: dict) -> tuple[MarketSpec | None, str]:
     player = normalize_player_name(display)
     if not player:
         return None, "empty player name"
-    from_plus = _num(match["n"]) - Decimal("0.5") if match else None  # "25+" means 25 or more = over 24.5
+    from_plus = _num(match["n"]) - Decimal("0.5") if match and "+" in (text or title) else _num(match["n"]) if match else None
     from_floor = None
     if floor is not None:
         if is_half_line(floor):
@@ -346,6 +354,7 @@ def parse_market(raw: dict) -> tuple[MarketSpec | None, str]:
 
 @dataclass
 class KalshiScan:
+    fetched_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     specs: list[MarketSpec] = field(default_factory=list)
     unresolved: list[tuple[dict, str]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
